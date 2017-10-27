@@ -21,8 +21,6 @@ import (
 	"net/http/pprof"
 	"sort"
 	"strconv"
-	"sync"
-	"sync/atomic"
 
 	restful "github.com/emicklei/go-restful"
 	"github.com/golang/glog"
@@ -47,102 +45,6 @@ type DiscoveryService struct {
 	cdsCache *discoveryCache
 	rdsCache *discoveryCache
 	ldsCache *discoveryCache
-}
-
-type discoveryCacheStatEntry struct {
-	Hit  uint64 `json:"hit"`
-	Miss uint64 `json:"miss"`
-}
-
-type discoveryCacheStats struct {
-	Stats map[string]*discoveryCacheStatEntry `json:"cache_stats"`
-}
-
-type discoveryCacheEntry struct {
-	data []byte
-	hit  uint64 // atomic
-	miss uint64 // atomic
-}
-
-type discoveryCache struct {
-	disabled bool
-	mu       sync.RWMutex
-	cache    map[string]*discoveryCacheEntry
-}
-
-func newDiscoveryCache(enabled bool) *discoveryCache {
-	return &discoveryCache{
-		disabled: !enabled,
-		cache:    make(map[string]*discoveryCacheEntry),
-	}
-}
-func (c *discoveryCache) cachedDiscoveryResponse(key string) ([]byte, bool) {
-	if c.disabled {
-		return nil, false
-	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	// Miss - entry.miss is updated in updateCachedDiscoveryResponse
-	entry, ok := c.cache[key]
-	if !ok || entry.data == nil {
-		return nil, false
-	}
-
-	// Hit
-	atomic.AddUint64(&entry.hit, 1)
-	return entry.data, true
-}
-
-func (c *discoveryCache) updateCachedDiscoveryResponse(key string, data []byte) {
-	if c.disabled {
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	entry, ok := c.cache[key]
-	if !ok {
-		entry = &discoveryCacheEntry{}
-		c.cache[key] = entry
-	} else if entry.data != nil {
-		glog.Warningf("Overriding cached data for entry %v", key)
-	}
-	entry.data = data
-	atomic.AddUint64(&entry.miss, 1)
-}
-
-func (c *discoveryCache) clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, v := range c.cache {
-		v.data = nil
-	}
-}
-
-func (c *discoveryCache) resetStats() {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for _, v := range c.cache {
-		atomic.StoreUint64(&v.hit, 0)
-		atomic.StoreUint64(&v.miss, 0)
-	}
-}
-
-func (c *discoveryCache) stats() map[string]*discoveryCacheStatEntry {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	stats := make(map[string]*discoveryCacheStatEntry, len(c.cache))
-	for k, v := range c.cache {
-		stats[k] = &discoveryCacheStatEntry{
-			Hit:  atomic.LoadUint64(&v.hit),
-			Miss: atomic.LoadUint64(&v.miss),
-		}
-	}
-	return stats
 }
 
 type hosts struct {
@@ -391,7 +293,7 @@ func (ds *DiscoveryService) ListEndpoints(request *restful.Request, response *re
 			errorResponse(response, http.StatusInternalServerError, "EDS "+err.Error())
 			return
 		}
-		ds.sdsCache.updateCachedDiscoveryResponse(key, out)
+		ds.sdsCache.updateCachedDiscoveryResponse(key, map[string]struct{}{}, out)
 	}
 	writeResponse(response, out)
 }
@@ -416,12 +318,13 @@ func (ds *DiscoveryService) ListClusters(request *restful.Request, response *res
 			return
 		}
 
-		clusters := buildClusters(ds.Environment, role)
+		env, refs := trackEnvironment(ds.Environment)
+		clusters := buildClusters(env, role)
 		if out, err = json.MarshalIndent(ClusterManager{Clusters: clusters}, " ", " "); err != nil {
 			errorResponse(response, http.StatusInternalServerError, "CDS "+err.Error())
 			return
 		}
-		ds.cdsCache.updateCachedDiscoveryResponse(key, out)
+		ds.cdsCache.updateCachedDiscoveryResponse(key, refs, out)
 	}
 	writeResponse(response, out)
 }
@@ -437,13 +340,14 @@ func (ds *DiscoveryService) ListListeners(request *restful.Request, response *re
 			return
 		}
 
-		listeners := buildListeners(ds.Environment, role)
+		env, refs := trackEnvironment(ds.Environment)
+		listeners := buildListeners(env, role)
 		out, err = json.MarshalIndent(ldsResponse{Listeners: listeners}, " ", " ")
 		if err != nil {
 			errorResponse(response, http.StatusInternalServerError, "LDS "+err.Error())
 			return
 		}
-		ds.ldsCache.updateCachedDiscoveryResponse(key, out)
+		ds.ldsCache.updateCachedDiscoveryResponse(key, refs, out)
 	}
 	writeResponse(response, out)
 }
@@ -461,13 +365,14 @@ func (ds *DiscoveryService) ListRoutes(request *restful.Request, response *restf
 			return
 		}
 
+		store, refs := trackStore(ds.IstioConfigStore)
 		routeConfigName := request.PathParameter(RouteConfigName)
-		routeConfig := buildRDSRoute(ds.Mesh, role, routeConfigName, ds.ServiceDiscovery, ds.IstioConfigStore)
+		routeConfig := buildRDSRoute(ds.Mesh, role, routeConfigName, ds.ServiceDiscovery, store)
 		if out, err = json.MarshalIndent(routeConfig, " ", " "); err != nil {
 			errorResponse(response, http.StatusInternalServerError, "RDS "+err.Error())
 			return
 		}
-		ds.rdsCache.updateCachedDiscoveryResponse(key, out)
+		ds.rdsCache.updateCachedDiscoveryResponse(key, refs, out)
 	}
 	writeResponse(response, out)
 }
